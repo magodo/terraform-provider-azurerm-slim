@@ -9,6 +9,7 @@ import (
 	"go/types"
 	"log"
 	"os"
+	"strings"
 
 	"golang.org/x/tools/go/packages"
 )
@@ -16,7 +17,7 @@ import (
 func run() error {
 	dir := "."
 	cfg := packages.Config{Dir: dir, Mode: packages.LoadSyntax}
-	pkgs, err := packages.Load(&cfg, "./internal/tf/pluginsdk", "./internal/sdk", "./internal/services/batch")
+	pkgs, err := packages.Load(&cfg, "./internal/...")
 	if err != nil {
 		return err
 	}
@@ -24,9 +25,24 @@ func run() error {
 		return errors.New("packages contain errors")
 	}
 
-	pluginsdkPkg := pkgs[0]
-	sdkPkg := pkgs[1]
-	pkgs = pkgs[2:]
+	var pluginsdkPkg, sdkPkg *packages.Package
+	var servicePkgs []*packages.Package
+
+	for _, pkg := range pkgs {
+		p := pkg.PkgPath
+		if p == "github.com/hashicorp/terraform-provider-azurerm/internal/tf/pluginsdk" {
+			pluginsdkPkg = pkg
+			continue
+		}
+		if p == "github.com/hashicorp/terraform-provider-azurerm/internal/sdk" {
+			sdkPkg = pkg
+			continue
+		}
+		if strings.HasPrefix(p, "github.com/hashicorp/terraform-provider-azurerm/internal/services/") {
+			servicePkgs = append(servicePkgs, pkg)
+			continue
+		}
+	}
 
 	var crudFuncTypeU types.Type
 	for ident, obj := range pluginsdkPkg.TypesInfo.Defs {
@@ -42,7 +58,7 @@ func run() error {
 		}
 	}
 
-	for _, pkg := range pkgs {
+	for _, pkg := range servicePkgs {
 		for _, file := range pkg.Syntax {
 			if err := forUntyped(pkg, file, crudFuncTypeU); err != nil {
 				return err
