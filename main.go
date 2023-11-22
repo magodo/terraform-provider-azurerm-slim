@@ -44,151 +44,178 @@ func run() error {
 		}
 	}
 
-	var crudFuncTypeU types.Type
+	if err := forUntyped(pluginsdkPkg, servicePkgs); err != nil {
+		return err
+	}
+
+	if err := forTyped(sdkPkg, servicePkgs); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func forUntyped(pluginsdkPkg *packages.Package, servicePkgs []*packages.Package) error {
+	var crudFuncType types.Type
+
 	for ident, obj := range pluginsdkPkg.TypesInfo.Defs {
 		if ident.Name == "CreateFunc" {
-			crudFuncTypeU = obj.(*types.TypeName).Type().(*types.Named).Underlying().(*types.Signature)
+			crudFuncType = obj.(*types.TypeName).Type().(*types.Named).Underlying().(*types.Signature)
 		}
 	}
 
-	var crudFuncTypeT types.Type
+	// Find all uses (i.e. ident -> types.Object) of the CUD functions in the schema declaration
+	cudObjs := map[types.Object]bool{}
+	for _, pkg := range servicePkgs {
+		for _, file := range pkg.Syntax {
+			for _, decl := range file.Decls {
+				fdecl, ok := decl.(*ast.FuncDecl)
+				if !ok {
+					continue
+				}
+				if fdecl.Type == nil || fdecl.Type.Results == nil {
+					continue
+				}
+				if len(fdecl.Type.Results.List) != 1 {
+					continue
+				}
+				ret := fdecl.Type.Results.List[0]
+				sexpr, ok := ret.Type.(*ast.StarExpr)
+				if !ok {
+					continue
+				}
+				sel, ok := sexpr.X.(*ast.SelectorExpr)
+				if !ok {
+					continue
+				}
+				x, ok := sel.X.(*ast.Ident)
+				if !ok {
+					continue
+				}
+				if x.Name != "pluginsdk" {
+					continue
+				}
+				if sel.Sel.Name != "Resource" {
+					continue
+				}
+				ast.Inspect(fdecl.Body, func(n ast.Node) bool {
+					kvexpr, ok := n.(*ast.KeyValueExpr)
+					if !ok {
+						return true
+					}
+					keyIdent, ok := kvexpr.Key.(*ast.Ident)
+					if !ok {
+						return true
+					}
+					if !(keyIdent.Name == "Create" || keyIdent.Name == "Update" || keyIdent.Name == "Delete") {
+						return true
+					}
+					if !types.Identical(pkg.TypesInfo.TypeOf(kvexpr.Value), crudFuncType) {
+						return true
+					}
+					cudObjs[pkg.TypesInfo.Uses[kvexpr.Value.(*ast.Ident)]] = true
+					return false
+				})
+			}
+		}
+	}
+
+	// Rewrite these CUD function's definitions
+	for _, pkg := range servicePkgs {
+		for _, file := range pkg.Syntax {
+			var modified bool
+			for _, decl := range file.Decls {
+				fdecl, ok := decl.(*ast.FuncDecl)
+				if !ok {
+					continue
+				}
+				if _, ok := cudObjs[pkg.TypesInfo.Defs[fdecl.Name]]; !ok {
+					continue
+				}
+				modified = true
+				fdecl.Body.List = []ast.Stmt{
+					&ast.ReturnStmt{Results: []ast.Expr{&ast.Ident{Name: "nil"}}},
+				}
+			}
+			if modified {
+				if err := write(file, pkg.Fset); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func forTyped(sdkPkg *packages.Package, servicePkgs []*packages.Package) error {
+	var crudFuncType types.Type
 	for ident, obj := range sdkPkg.TypesInfo.Defs {
 		if ident.Name == "ResourceRunFunc" {
-			crudFuncTypeT = obj.(*types.TypeName).Type().(*types.Named).Underlying().(*types.Signature)
+			crudFuncType = obj.(*types.TypeName).Type().(*types.Named).Underlying().(*types.Signature)
 		}
 	}
 
 	for _, pkg := range servicePkgs {
 		for _, file := range pkg.Syntax {
-			if err := forUntyped(pkg, file, crudFuncTypeU); err != nil {
-				return err
+			var modified bool
+			for _, decl := range file.Decls {
+				fdecl, ok := decl.(*ast.FuncDecl)
+				if !ok {
+					continue
+				}
+				if fdecl.Name == nil {
+					continue
+				}
+				if name := fdecl.Name.Name; name != "Create" && name != "Update" && name != "Delete" {
+					continue
+				}
+				if fdecl.Type == nil || fdecl.Type.Results == nil {
+					continue
+				}
+				if len(fdecl.Type.Results.List) != 1 {
+					continue
+				}
+				ret := fdecl.Type.Results.List[0]
+				sel, ok := ret.Type.(*ast.SelectorExpr)
+				if !ok {
+					continue
+				}
+				x, ok := sel.X.(*ast.Ident)
+				if !ok {
+					continue
+				}
+				if x.Name != "sdk" {
+					continue
+				}
+				if sel.Sel.Name != "ResourceFunc" {
+					continue
+				}
+				ast.Inspect(fdecl.Body, func(n ast.Node) bool {
+					kvexpr, ok := n.(*ast.KeyValueExpr)
+					if !ok {
+						return true
+					}
+					keyIdent, ok := kvexpr.Key.(*ast.Ident)
+					if !ok {
+						return true
+					}
+					if keyIdent.Name != "Func" {
+						return true
+					}
+					if !types.Identical(pkg.TypesInfo.TypeOf(kvexpr.Value), crudFuncType) {
+						return true
+					}
+					modified = true
+					kvexpr.Value = &ast.Ident{Name: "nil"}
+					return false
+				})
 			}
-			if err := forTyped(pkg, file, crudFuncTypeT); err != nil {
-				return err
+			if modified {
+				if err := write(file, pkg.Fset); err != nil {
+					return err
+				}
 			}
-		}
-	}
-
-	return nil
-}
-
-func forUntyped(pkg *packages.Package, file *ast.File, funcType types.Type) error {
-	var modified bool
-	for _, decl := range file.Decls {
-		fdecl, ok := decl.(*ast.FuncDecl)
-		if !ok {
-			continue
-		}
-		if fdecl.Type == nil || fdecl.Type.Results == nil {
-			continue
-		}
-		if len(fdecl.Type.Results.List) != 1 {
-			continue
-		}
-		ret := fdecl.Type.Results.List[0]
-		sexpr, ok := ret.Type.(*ast.StarExpr)
-		if !ok {
-			continue
-		}
-		sel, ok := sexpr.X.(*ast.SelectorExpr)
-		if !ok {
-			continue
-		}
-		x, ok := sel.X.(*ast.Ident)
-		if !ok {
-			continue
-		}
-		if x.Name != "pluginsdk" {
-			continue
-		}
-		if sel.Sel.Name != "Resource" {
-			continue
-		}
-		ast.Inspect(fdecl.Body, func(n ast.Node) bool {
-			kvexpr, ok := n.(*ast.KeyValueExpr)
-			if !ok {
-				return true
-			}
-			keyIdent, ok := kvexpr.Key.(*ast.Ident)
-			if !ok {
-				return true
-			}
-			if !(keyIdent.Name == "Create" || keyIdent.Name == "Update" || keyIdent.Name == "Delete") {
-				return true
-			}
-			if !types.Identical(pkg.TypesInfo.TypeOf(kvexpr.Value), funcType) {
-				return true
-			}
-			modified = true
-			kvexpr.Value = &ast.Ident{Name: "nil"}
-			return false
-		})
-	}
-	if modified {
-		if err := write(file, pkg.Fset); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func forTyped(pkg *packages.Package, file *ast.File, funcType types.Type) error {
-	var modified bool
-	for _, decl := range file.Decls {
-		fdecl, ok := decl.(*ast.FuncDecl)
-		if !ok {
-			continue
-		}
-		if fdecl.Name == nil {
-			continue
-		}
-		if name := fdecl.Name.Name; name != "Create" && name != "Update" && name != "Delete" {
-			continue
-		}
-		if fdecl.Type == nil || fdecl.Type.Results == nil {
-			continue
-		}
-		if len(fdecl.Type.Results.List) != 1 {
-			continue
-		}
-		ret := fdecl.Type.Results.List[0]
-		sel, ok := ret.Type.(*ast.SelectorExpr)
-		if !ok {
-			continue
-		}
-		x, ok := sel.X.(*ast.Ident)
-		if !ok {
-			continue
-		}
-		if x.Name != "sdk" {
-			continue
-		}
-		if sel.Sel.Name != "ResourceFunc" {
-			continue
-		}
-		ast.Inspect(fdecl.Body, func(n ast.Node) bool {
-			kvexpr, ok := n.(*ast.KeyValueExpr)
-			if !ok {
-				return true
-			}
-			keyIdent, ok := kvexpr.Key.(*ast.Ident)
-			if !ok {
-				return true
-			}
-			if keyIdent.Name != "Func" {
-				return true
-			}
-			if !types.Identical(pkg.TypesInfo.TypeOf(kvexpr.Value), funcType) {
-				return true
-			}
-			modified = true
-			kvexpr.Value = &ast.Ident{Name: "nil"}
-			return false
-		})
-	}
-	if modified {
-		if err := write(file, pkg.Fset); err != nil {
-			return err
 		}
 	}
 	return nil
