@@ -92,7 +92,7 @@ func forUntyped(pluginsdkPkg *packages.Package, servicePkgs []*packages.Package)
 				if !ok {
 					continue
 				}
-				if x.Name != "pluginsdk" {
+				if x.Name != "pluginsdk" && x.Name != "schema" {
 					continue
 				}
 				if sel.Sel.Name != "Resource" {
