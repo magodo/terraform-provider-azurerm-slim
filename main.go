@@ -149,10 +149,40 @@ func forUntyped(pluginsdkPkg *packages.Package, servicePkgs []*packages.Package)
 }
 
 func forTyped(sdkPkg *packages.Package, servicePkgs []*packages.Package) error {
-	var crudFuncType types.Type
+	var resourceInterfaceType *types.Interface
 	for ident, obj := range sdkPkg.TypesInfo.Defs {
-		if ident.Name == "ResourceRunFunc" {
-			crudFuncType = obj.(*types.TypeName).Type().(*types.Named).Underlying().(*types.Signature)
+		if ident.Name == "Resource" {
+			if types.IsInterface(obj.Type()) {
+				resourceInterfaceType = obj.Type().(*types.Named).Underlying().(*types.Interface)
+				break
+			}
+		}
+	}
+
+	// Look for all resource objects (i.e. ident -> types.Object) that implement the Resource interface
+	resObjs := map[types.Object]bool{}
+	for _, pkg := range servicePkgs {
+		for _, file := range pkg.Syntax {
+			for _, decl := range file.Decls {
+				gdecl, ok := decl.(*ast.GenDecl)
+				if !ok {
+					continue
+				}
+				for _, spec := range gdecl.Specs {
+					tspec, ok := spec.(*ast.TypeSpec)
+					if !ok {
+						continue
+					}
+					obj := pkg.TypesInfo.Defs[tspec.Name]
+					if obj == nil {
+						continue
+					}
+					if !types.Implements(obj.Type(), resourceInterfaceType) {
+						continue
+					}
+					resObjs[obj] = true
+				}
+			}
 		}
 	}
 
@@ -164,52 +194,42 @@ func forTyped(sdkPkg *packages.Package, servicePkgs []*packages.Package) error {
 				if !ok {
 					continue
 				}
+				recv := fdecl.Recv
+				if recv == nil {
+					continue
+				}
+				recvl := recv.List
+				if len(recvl) != 1 {
+					continue
+				}
+				recvT, ok := recvl[0].Type.(*ast.Ident)
+				if !ok {
+					continue
+				}
+				if _, ok := resObjs[pkg.TypesInfo.Uses[recvT]]; !ok {
+					continue
+				}
 				if fdecl.Name == nil {
 					continue
 				}
 				if name := fdecl.Name.Name; name != "Create" && name != "Update" && name != "Delete" {
 					continue
 				}
-				if fdecl.Type == nil || fdecl.Type.Results == nil {
-					continue
+				modified = true
+				fdecl.Body.List = []ast.Stmt{
+					&ast.ReturnStmt{Results: []ast.Expr{
+						&ast.CompositeLit{
+							Type: &ast.SelectorExpr{
+								X: &ast.Ident{
+									Name: "sdk",
+								},
+								Sel: &ast.Ident{
+									Name: "ResourceFunc",
+								},
+							},
+						},
+					}},
 				}
-				if len(fdecl.Type.Results.List) != 1 {
-					continue
-				}
-				ret := fdecl.Type.Results.List[0]
-				sel, ok := ret.Type.(*ast.SelectorExpr)
-				if !ok {
-					continue
-				}
-				x, ok := sel.X.(*ast.Ident)
-				if !ok {
-					continue
-				}
-				if x.Name != "sdk" {
-					continue
-				}
-				if sel.Sel.Name != "ResourceFunc" {
-					continue
-				}
-				ast.Inspect(fdecl.Body, func(n ast.Node) bool {
-					kvexpr, ok := n.(*ast.KeyValueExpr)
-					if !ok {
-						return true
-					}
-					keyIdent, ok := kvexpr.Key.(*ast.Ident)
-					if !ok {
-						return true
-					}
-					if keyIdent.Name != "Func" {
-						return true
-					}
-					if !types.Identical(pkg.TypesInfo.TypeOf(kvexpr.Value), crudFuncType) {
-						return true
-					}
-					modified = true
-					kvexpr.Value = &ast.Ident{Name: "nil"}
-					return false
-				})
 			}
 			if modified {
 				if err := write(file, pkg.Fset); err != nil {
